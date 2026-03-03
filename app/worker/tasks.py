@@ -27,7 +27,7 @@ from app.worker.pipeline import get_pipeline
 
 logger = get_logger(__name__)
 
-# ── Synchronous DB session for Celery (not async) ─────────────────────────
+# ── Synchronous DB session for Celery ─────────────────────────────────────────
 _sync_engine = None
 _sync_session_factory = None
 
@@ -47,7 +47,7 @@ def _get_sync_session() -> Session:
     return _sync_session_factory()
 
 
-# ── Helper: update job status ─────────────────────────────────────────────
+# ── Helper: update job status ──────────────────────────────────────────────────
 def _update_status(
     session: Session,
     job_id: UUID,
@@ -84,24 +84,15 @@ def _update_status(
     reject_on_worker_lost=True,
 )
 def process_plate_image(self, job_id_str: str) -> dict:
-    """
-    Main Celery task for CFU detection.
-
-    Args:
-        job_id_str: UUID string of the PlateJob row.
-
-    Returns:
-        dict summary of the result (stored in Celery result backend).
-    """
     job_id = UUID(job_id_str)
     session = _get_sync_session()
 
     try:
-        # ── Step 1: Fetch job metadata ─────────────────────────────
         from sqlalchemy import select
         from sqlalchemy.orm import selectinload
-        from app.models import PlateImage, PlateResult, AuditLog
+        from app.models import PlateResult
 
+        # ── Step 1: Fetch job ──────────────────────────────────────────────────
         job = session.execute(
             select(PlateJob)
             .options(selectinload(PlateJob.image))
@@ -115,70 +106,25 @@ def process_plate_image(self, job_id_str: str) -> dict:
             logger.warning("Job already failed — skipping", job_id=job_id_str)
             return {"status": "skipped"}
 
-        # ── Step 2: Mark RUNNING ───────────────────────────────────
+        # ── Step 2: Mark RUNNING ───────────────────────────────────────────────
         _update_status(session, job_id, JobStatus.RUNNING, progress=0.05)
         _audit(session, job_id, "job_started", "worker")
 
-        # ── Step 3: Download image ─────────────────────────────────
+        # ── Step 3: Download image ─────────────────────────────────────────────
         storage = StorageService()
         image_bytes = storage.download_image(job.image.storage_path)
         _update_status(session, job_id, JobStatus.RUNNING, progress=0.20)
         logger.info("Downloaded image", job_id=job_id_str, bytes=len(image_bytes))
 
-       # ── Step 4: Run detection pipeline ────────────────────────
+        # ── Step 4: Run detection pipeline ────────────────────────────────────
         pipeline = get_pipeline()
         _update_status(session, job_id, JobStatus.RUNNING, progress=0.40)
-
         result = pipeline.run(image_bytes)
         _update_status(session, job_id, JobStatus.RUNNING, progress=0.80)
 
-        # ── Normalize result (important fix) ──────────────────────
-        # Support both object-style and dict-style pipeline outputs
-        if isinstance(result, dict):
-            cfu_count_total = result.get("cfu_count", 0)
-            detections_json = []
-            quality_json = {}
-            confidence_json = {}
-            artifacts_json = {}
-            model_metadata_json = {}
-            annotated_url = None
-            needs_review = False
-            processing_time_ms = 0
-            overall_confidence = 1.0
-        else:
-            annotated_url = None
-
-            if getattr(result, "annotated_image_bytes", None):
-                storage = StorageService()
-                annotated_path = storage.upload_annotated_image(
-                    client_id=job.client_id,
-                    job_id=job_id,
-                    image_bytes=result.annotated_image_bytes,
-                )
-                annotated_url = storage.get_signed_url(annotated_path)
-
-            detections_json = [
-                {
-                    "x": d.x,
-                    "y": d.y,
-                    "radius_px": d.radius_px,
-                    "score": d.score,
-                }
-                for d in getattr(result, "detections", [])
-            ]
-
-            quality_json = getattr(result, "quality", {})
-            confidence_json = getattr(result, "confidence", {})
-            artifacts_json = {"annotated_image_url": annotated_url}
-            model_metadata_json = getattr(result, "model_metadata", {})
-            cfu_count_total = getattr(result, "cfu_count_total", 0)
-            needs_review = getattr(result, "needs_review", False)
-            processing_time_ms = getattr(result, "processing_time_ms", 0)
-            overall_confidence = getattr(result, "overall_confidence", 1.0)
-
-        # ── Step 5: Upload annotated image ────────────────────────
+        # ── Step 5: Upload annotated image ────────────────────────────────────
         annotated_url: str | None = None
-        if result.annotated_image_bytes:
+        if getattr(result, "annotated_image_bytes", None):
             annotated_path = storage.upload_annotated_image(
                 client_id=job.client_id,
                 job_id=job_id,
@@ -187,7 +133,7 @@ def process_plate_image(self, job_id_str: str) -> dict:
             annotated_url = storage.get_signed_url(annotated_path)
             _audit(session, job_id, "annotated_image_created", "worker")
 
-        # ── Step 6: Serialize detections ──────────────────────────
+        # ── Step 6: Serialize result ───────────────────────────────────────────
         detections_json = [
             {
                 "x": d.x,
@@ -195,7 +141,7 @@ def process_plate_image(self, job_id_str: str) -> dict:
                 "radius_px": d.radius_px,
                 "score": d.score,
             }
-            for d in result.detections
+            for d in getattr(result, "detections", [])
         ]
 
         quality_json = {
@@ -220,9 +166,9 @@ def process_plate_image(self, job_id_str: str) -> dict:
             "processing_time_ms": result.processing_time_ms,
         }
 
-           # ── Step 7: Save result to DB ──────────────────────────────
-        from app.models import PlateResult
+        cfu_count_total = getattr(result, "cfu_count_total", 0)
 
+        # ── Step 7: Save result to DB ─────────────────────────────────────────
         plate_result = PlateResult(
             job_id=job_id,
             cfu_count_total=cfu_count_total,
@@ -232,26 +178,15 @@ def process_plate_image(self, job_id_str: str) -> dict:
             artifacts=artifacts_json,
             model_metadata=model_metadata_json,
         )
-
         session.add(plate_result)
         session.commit()
 
-        # ── Step 8: Mark SUCCEEDED ─────────────────────────────────
-        _update_status(session, job_id, JobStatus.SUCCEEDED, progress=1.0)
-
-        return {
-            "status": "succeeded",
-            "job_id": job_id_str,
-            "cfu_count": cfu_count_total,
-            "needs_review": needs_review,
-        }
-
-        # ── Step 8: Mark SUCCEEDED ─────────────────────────────────
+        # ── Step 8: Mark SUCCEEDED ────────────────────────────────────────────
         _update_status(session, job_id, JobStatus.SUCCEEDED, progress=1.0)
         _audit(
             session, job_id, "job_completed", "worker",
             details={
-                "cfu_count": result.cfu_count_total,
+                "cfu_count": cfu_count_total,
                 "needs_review": result.needs_review,
                 "processing_ms": result.processing_time_ms,
             },
@@ -260,14 +195,14 @@ def process_plate_image(self, job_id_str: str) -> dict:
         logger.info(
             "Job completed successfully",
             job_id=job_id_str,
-            cfu_count=result.cfu_count_total,
+            cfu_count=cfu_count_total,
             confidence=result.overall_confidence,
         )
 
         return {
             "status": "succeeded",
             "job_id": job_id_str,
-            "cfu_count": result.cfu_count_total,
+            "cfu_count": cfu_count_total,
             "needs_review": result.needs_review,
         }
 
@@ -284,7 +219,6 @@ def process_plate_image(self, job_id_str: str) -> dict:
         except Exception as inner:
             logger.error("Failed to update failure status", error=str(inner))
 
-        # Retry for transient errors (network, I/O), not logic errors
         if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
             raise self.retry(exc=exc)
 
@@ -301,7 +235,6 @@ def _audit(
     actor: str,
     details: dict | None = None,
 ) -> None:
-    """Write a synchronous audit log row."""
     from app.models.audit import AuditLog
     log = AuditLog(
         job_id=job_id,

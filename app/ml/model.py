@@ -109,20 +109,31 @@ class CFUPipeline:
         return mask, (cx, cy, r)
 
     def _detect_colonies(self, gray, plate_mask):
+        # Mask to plate area only
         masked = cv2.bitwise_and(gray, gray, mask=plate_mask)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(masked)
-        blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        thresh = cv2.bitwise_and(thresh, thresh, mask=plate_mask)
+
+        # Use adaptive thresholding — works for both light and dark backgrounds
+        adaptive = cv2.adaptiveThreshold(
+            masked, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            blockSize=21,
+            C=5,
+        )
+        adaptive = cv2.bitwise_and(adaptive, adaptive, mask=plate_mask)
+
+        # Clean up noise
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
+        cleaned = cv2.morphologyEx(adaptive, cv2.MORPH_OPEN, kernel, iterations=1)
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=1)
+
         contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
         detections = []
         h, w = gray.shape
         min_area = (h * w) * 0.00005
         max_area = (h * w) * 0.05
+
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < min_area or area > max_area:
@@ -131,7 +142,7 @@ class CFUPipeline:
             if perimeter == 0:
                 continue
             circularity = 4 * 3.14159 * area / (perimeter ** 2)
-            if circularity < 0.35:
+            if circularity < 0.25:
                 continue
             (cx, cy), radius = cv2.minEnclosingCircle(cnt)
             score = min(1.0, circularity * (area / max_area) ** 0.1)

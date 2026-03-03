@@ -1,13 +1,12 @@
 from typing import Optional
 from uuid import UUID
-
 from pydantic import BaseModel, Field
 
 
 class Detection(BaseModel):
-    x: float = Field(..., ge=0.0, le=1.0, description="Normalized X coordinate")
-    y: float = Field(..., ge=0.0, le=1.0, description="Normalized Y coordinate")
-    radius_px: int = Field(..., ge=1, description="Radius in pixels")
+    x: float = Field(..., ge=0.0, description="X coordinate in pixels")
+    y: float = Field(..., ge=0.0, description="Y coordinate in pixels")
+    radius_px: float = Field(..., ge=0.0, description="Radius in pixels")
     score: float = Field(..., ge=0.0, le=1.0, description="Confidence score")
 
 
